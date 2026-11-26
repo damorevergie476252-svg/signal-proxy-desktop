@@ -43,7 +43,7 @@ jobs:
           from pathlib import Path, PurePosixPath
           if not Path('overlay.json').is_file():
               archive = Path('source-bundle.zip')
-              if hashlib.sha256(archive.read_bytes()).hexdigest() != 'cd94d8e70c9c43c76db1838ef9c038888179ace001b38e07f2b2849e3a2859ec':
+              if hashlib.sha256(archive.read_bytes()).hexdigest() != 'd40d6872c9b30e25def3dd38d0be90aa490b7616b9e7e2d023029dd2649c5bb5':
                   raise ValueError('Source bundle integrity mismatch')
               names = []
               with zipfile.ZipFile(archive) as stream:
