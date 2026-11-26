@@ -1,0 +1,212 @@
+name: Build and publish Signal Proxy
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ours/**'
+      - 'base/**'
+      - 'tools/**'
+      - 'build-tools/**'
+      - 'signer/**'
+      - 'vendor/**'
+      - 'channel.json'
+      - 'overlay.json'
+      - 'prepare-source.py'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild the current official stable version
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 2,14 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: signal-proxy-release
+  cancel-in-progress: false
+jobs:
+  hydrate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: source
+        name: Import the reviewed source archive on first setup
+        shell: python
+        run: |
+          import os, json, hashlib, zipfile, subprocess
+          from pathlib import Path, PurePosixPath
+          if not Path('overlay.json').is_file():
+              archive = Path('source-bundle.zip')
+              if hashlib.sha256(archive.read_bytes()).hexdigest() != 'cd94d8e70c9c43c76db1838ef9c038888179ace001b38e07f2b2849e3a2859ec':
+                  raise ValueError('Source bundle integrity mismatch')
+              names = []
+              with zipfile.ZipFile(archive) as stream:
+                  for entry in stream.infolist():
+                      name = PurePosixPath(entry.filename)
+                      if name.is_absolute() or '..' in name.parts or '\\' in entry.filename or name.parts[0] == '.github':
+                          raise ValueError('Unsafe source bundle entry')
+                      if ((entry.external_attr >> 16) & 0o170000) == 0o120000:
+                          raise ValueError('Source bundle symlinks are not accepted')
+                      target = Path(*name.parts)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(stream.read(entry))
+                      names.append(entry.filename)
+              subprocess.run(['git', 'add', '--'] + names, check=True)
+              subprocess.run(['git', '-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-m', 'Add reviewed Signal Proxy source and release tooling'], check=True)
+              subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('sha=' + commit + '\n')
+  detect:
+    needs: hydrate
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.release.outputs.needed }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.hydrate.outputs.sha }}
+          persist-credentials: false
+      - id: release
+        run: python tools/detect-release.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_BUILD: ${{ github.event_name == 'push' || inputs.force }}
+  build:
+    needs: [hydrate, detect]
+    if: needs.detect.outputs.needed == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      OFFICIAL_VERSION: ${{ needs.detect.outputs.version }}
+      SIGNAL_ENV: production
+      NODE_ENV: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.hydrate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: signalapp/Signal-Desktop
+          ref: ${{ needs.detect.outputs.tag }}
+          path: upstream
+          persist-credentials: false
+      - id: toolchain
+        run: python tools/read-toolchain.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+      - name: Prepare the customized source
+        shell: pwsh
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.toolchain.outputs.epoch }}
+          PNPM_VERSION: ${{ steps.toolchain.outputs.pnpm }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $date=[DateTime]::UtcNow.ToString('yyyyMMdd')
+          $revision=([int64]$env:GITHUB_RUN_NUMBER)*1000+[int64]$env:GITHUB_RUN_ATTEMPT
+          python prepare-source.py upstream Signal-Desktop-8.36.0-with-proxy --official-version $env:OFFICIAL_VERSION --date $date --revision $revision --official-epoch $env:SOURCE_DATE_EPOCH --channel channel.json
+          if ($LASTEXITCODE -ne 0) { throw 'Customized source merge failed' }
+          Add-Content Signal-Desktop-8.36.0-with-proxy/.npmrc "`nenable-global-virtual-store=false"
+          "SOURCE_DATE_EPOCH=$env:SOURCE_DATE_EPOCH" >> $env:GITHUB_ENV
+          npm install --global "pnpm@$env:PNPM_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'pnpm setup failed' }
+      - name: Install locked dependencies without install scripts
+        working-directory: Signal-Desktop-8.36.0-with-proxy
+        run: pnpm install --frozen-lockfile --ignore-scripts --prod=false
+      - name: Download and verify the official Windows release
+        shell: pwsh
+        run: |
+          node tools/download-official.cjs Signal-Desktop-8.36.0-with-proxy $env:OFFICIAL_VERSION work/official.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Official download verification failed' }
+          $signature=Get-AuthenticodeSignature -LiteralPath work/official.exe
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Signal Messenger') { throw 'Official Windows signature is not valid' }
+          7z x work/official.exe -owork/installer-outer -y
+          if ($LASTEXITCODE -ne 0) { throw 'Installer extraction failed' }
+          $archives=@(Get-ChildItem work/installer-outer -Recurse -File -Filter app-64.7z)
+          if ($archives.Count -ne 1) { throw 'Official installer layout changed' }
+          7z x $archives[0].FullName -owork/official-unpacked -y
+          if ($LASTEXITCODE -ne 0) { throw 'Application extraction failed' }
+          node tools/restore-native.cjs Signal-Desktop-8.36.0-with-proxy work/official-unpacked $env:OFFICIAL_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Native component matching failed' }
+      - name: Generate application resources
+        working-directory: Signal-Desktop-8.36.0-with-proxy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $commands=@(
+            @{exe='node';args=@('node_modules/electron/install.js')},
+            @{exe='python';args=@('../tools/supply-optional-types.py','.')},
+            @{exe='pnpm';args=@('--filter','@signalapp/types','run','build')},
+            @{exe='pnpm';args=@('--dir','node_modules/@signalapp/windows-ucv','run','build')},
+            @{exe='pnpm';args=@('--dir','node_modules/@signalapp/mock-server','run','build')},
+            @{exe='pnpm';args=@('run','build:acknowledgments')},
+            @{exe='pnpm';args=@('run','generate')},
+            @{exe='node';args=@('../tools/configure-runtime.cjs','.')}
+          )
+          foreach ($command in $commands) { & $command.exe @($command.args); if ($LASTEXITCODE -ne 0) { throw 'Resource generation failed' } }
+      - name: Typecheck and test all custom features
+        run: ./tools/run-gates.ps1 -Project Signal-Desktop-8.36.0-with-proxy
+      - name: Package and verify the release
+        shell: pwsh
+        run: |
+          node tools/build-packages.cjs Signal-Desktop-8.36.0-with-proxy
+          if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
+          node tools/verify-package.cjs Signal-Desktop-8.36.0-with-proxy
+          if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+          $env:SIGNAL_TEST_FIX='17'
+          node --test build-tools/test-packaged-startup.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged identity test failed' }
+          node tools/build-packages.cjs Signal-Desktop-8.36.0-with-proxy --smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated package build failed' }
+          ./tools/smoke.ps1
+          python tools/package-source.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive creation failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release
+          if-no-files-found: error
+          path: |
+            dist-proxy-fix17/*.exe
+            dist-proxy-fix17/*.exe.blockmap
+            dist-proxy-fix17/*source.zip
+            dist-proxy-fix17/*verification.json
+  publish:
+    needs: [hydrate, detect, build]
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.hydrate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.3'
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-release
+          path: release
+      - name: Install the pinned, independent signing runtime
+        working-directory: signer
+        run: npm ci --ignore-scripts
+      - name: Sign and verify the tested installer
+        run: node tools/sign-release.cjs release '${{ needs.detect.outputs.version }}'
+        env:
+          SIGNAL_UPDATE_PRIVATE_KEY: ${{ secrets.SIGNAL_PROXY_UPDATE_PRIVATE_KEY }}
+      - name: Publish all assets, then make the release available to clients
+        run: ./tools/publish-release.ps1 -Artifacts release
+        env:
+          RELEASE_COMMIT: ${{ needs.hydrate.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
