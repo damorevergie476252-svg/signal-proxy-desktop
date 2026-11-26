@@ -11,6 +11,8 @@ on:
       - 'vendor/**'
       - 'channel.json'
       - 'overlay.json'
+      - 'source-bundle.zip'
+      - 'source-bundle.sha256'
       - 'prepare-source.py'
       - '.github/workflows/release.yml'
   workflow_dispatch:
@@ -43,7 +45,8 @@ jobs:
           from pathlib import Path, PurePosixPath
           if not Path('overlay.json').is_file():
               archive = Path('source-bundle.zip')
-              if hashlib.sha256(archive.read_bytes()).hexdigest() != 'd40d6872c9b30e25def3dd38d0be90aa490b7616b9e7e2d023029dd2649c5bb5':
+              expected = Path('source-bundle.sha256').read_text(encoding='ascii').strip()
+              if len(expected) != 64 or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
                   raise ValueError('Source bundle integrity mismatch')
               names = []
               with zipfile.ZipFile(archive) as stream:
